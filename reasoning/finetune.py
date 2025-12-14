@@ -8,21 +8,44 @@ Optimized fine tuning pipeline for Phi-3.5-mini
 import inspect
 import re
 import numpy as np
+import pandas as pd
 import torch
-from datasets import load_dataset
+import torch.nn as nn
+from datasets import Dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     TrainingArguments,
     Trainer,
     DataCollatorForSeq2Seq,
-    BitsAndBytesConfig,
     EvalPrediction,
     TrainerCallback,
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-import bitsandbytes as bnb
+from peft import LoraConfig, get_peft_model
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+
+
+class LoRALayer(nn.Module):
+    def __init__(self, in_dim, out_dim, rank, alpha):
+        super().__init__()
+        self.A = nn.Parameter(torch.randn(in_dim, rank) / rank)
+        self.B = nn.Parameter(torch.zeros(rank, out_dim))
+        self.alpha = alpha
+
+    def forward(self, x):
+        return self.alpha * (x @ self.A @ self.B)
+
+
+class LinearWithLoRA(nn.Module):
+    def __init__(self, linear, rank, alpha):
+        super().__init__()
+        self.linear = linear
+        self.lora = LoRALayer(
+            linear.in_features, linear.out_features, rank, alpha
+        )
+
+    def forward(self, x):
+        return self.linear(x) + self.lora(x)
 
 
 def extract_label(text: str) -> int:
@@ -63,24 +86,22 @@ class FraudReasoningTrainer:
     def __init__(
         self,
         model_name: str = "microsoft/Phi-3.5-mini-instruct",
-        train_path: str = "data/fraud_train_multi_task.jsonl",
-        val_path: str = "data/fraud_val_multi_task.jsonl",
-        test_path: str = "data/fraud_test_multi_task.jsonl",
+        train_path: str = "data/train_clean.csv",
+        val_path: str = "data/validation_clean.csv",
+        test_path: str = "data/test_clean.csv",
         output_dir: str = "models/phi-3.5-fraud-reasoning",
     ):
         self.model_name = model_name
-        self.paths = {
-            "train": train_path,
-            "validation": val_path,
-            "test": test_path,
-        }
+        self.train_path = train_path
+        self.val_path = val_path
+        self.test_path = test_path
         self.output_dir = output_dir
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # ----------------------------------------------------------
-    # load tokenizer + model (4bit optional)
+    # load tokenizer + model
     # ----------------------------------------------------------
-    def load_model_and_tokenizer(self, use_4bit: bool = True):
+    def load_model_and_tokenizer(self):
         print(f"loading model {self.model_name} ...")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -91,35 +112,16 @@ class FraudReasoningTrainer:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "right"
 
-        if use_4bit:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_use_double_quant=True,
-            )
-
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name,
-                quantization_config=bnb_config,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                trust_remote_code=True,
-            )
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(
-                self.model_name,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                trust_remote_code=True,
-            )
-
-        # prepare for kbit + LoRA
-        self.model = prepare_model_for_kbit_training(self.model)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype=torch.float32,  # use float32 for stability
+            device_map="auto",
+            trust_remote_code=True,
+        )
         
-        # important for LoRA on 4bit
-        if hasattr(self.model, "enable_input_require_grads"):
-            self.model.enable_input_require_grads()
+        # freeze all parameters first
+        for param in self.model.parameters():
+            param.requires_grad = False
         
         # disable cache during training (required for gradient checkpointing)
         if hasattr(self.model, "config"):
@@ -128,14 +130,39 @@ class FraudReasoningTrainer:
         print("model loaded")
 
     # ----------------------------------------------------------
+    # LoRA helper - custom implementation
+    # ----------------------------------------------------------
+    def replace_linear_with_lora(self, rank=8, alpha=16):
+        """Replace linear layers with LoRA layers"""
+        for name, module in self.model.named_children():
+            if isinstance(module, nn.Linear):
+                # Skip the final output layer
+                if 'out_head' in name or 'lm_head' in name:
+                    continue
+                # Replace with LoRA
+                lora_layer = LinearWithLoRA(module, rank, alpha)
+                setattr(self.model, name, lora_layer)
+            else:
+                # Recursively apply to submodules
+                self._replace_linear_recursive(module, rank, alpha)
+    
+    def _replace_linear_recursive(self, module, rank, alpha):
+        for name, child in module.named_children():
+            if isinstance(child, nn.Linear):
+                lora_layer = LinearWithLoRA(child, rank, alpha)
+                setattr(module, name, lora_layer)
+            else:
+                self._replace_linear_recursive(child, rank, alpha)
+    
+    # ----------------------------------------------------------
     # LoRA optimization config
     # ----------------------------------------------------------
-    def setup_lora(self):
+    def setup_lora(self, rank=16, alpha=32):
         print("initializing lora...")
 
         lora_config = LoraConfig(
-            r=32,
-            lora_alpha=64,
+            r=rank,
+            lora_alpha=alpha,
             target_modules=[
                 "q_proj",
                 "k_proj",
@@ -163,20 +190,58 @@ class FraudReasoningTrainer:
     # dataset prep: chat formatting + tokenization + masking
     # ----------------------------------------------------------
     def prepare_dataset(self, max_length: int = 2048, dataset_fraction: float = 1.0):
-        print("loading dataset...")
+        print("loading dataset from CSV files...")
 
-        dataset = load_dataset(
-            "json",
-            data_files=self.paths,
-        )
+        # Load CSV files
+        train_df = pd.read_csv(self.train_path)
+        val_df = pd.read_csv(self.val_path)
+        test_df = pd.read_csv(self.test_path)
         
         # reduce dataset size by percentage (reproducible with seed)
         if dataset_fraction < 1.0:
-            for split in ["train", "validation", "test"]:
-                original_size = len(dataset[split])
-                num_samples = int(original_size * dataset_fraction)
-                dataset[split] = dataset[split].shuffle(seed=42).select(range(num_samples))
-                print(f"reduced {split} dataset from {original_size} to {len(dataset[split])} samples ({dataset_fraction*100:.1f}%)")
+            train_df = train_df.sample(frac=dataset_fraction, random_state=42).reset_index(drop=True)
+            val_df = val_df.sample(frac=dataset_fraction, random_state=42).reset_index(drop=True)
+            test_df = test_df.sample(frac=dataset_fraction, random_state=42).reset_index(drop=True)
+            print(f"reduced datasets to {dataset_fraction*100:.1f}%")
+        
+        # Convert to reasoning format
+        def create_reasoning_output(row):
+            label = "fraud" if row['label'] == 1 else "legitimate"
+            confidence = np.random.randint(85, 98)
+            
+            output = f"""classification: {label}
+confidence: {confidence}%
+
+analysis:
+- message context and patterns analyzed
+- fraud indicators evaluated
+
+risk: {'high' if label == 'fraud' else 'low'}
+recommended action: {'report as fraud' if label == 'fraud' else 'safe to continue'}"""
+            return output
+        
+        train_df['instruction'] = 'check this message for fraud and explain your reasoning'
+        train_df['input'] = train_df['text']
+        train_df['output'] = train_df.apply(create_reasoning_output, axis=1)
+        
+        val_df['instruction'] = 'check this message for fraud and explain your reasoning'
+        val_df['input'] = val_df['text']
+        val_df['output'] = val_df.apply(create_reasoning_output, axis=1)
+        
+        test_df['instruction'] = 'check this message for fraud and explain your reasoning'
+        test_df['input'] = test_df['text']
+        test_df['output'] = test_df.apply(create_reasoning_output, axis=1)
+        
+        # Convert to HF Dataset
+        dataset = {
+            "train": Dataset.from_pandas(train_df[['instruction', 'input', 'output', 'label']]),
+            "validation": Dataset.from_pandas(val_df[['instruction', 'input', 'output', 'label']]),
+            "test": Dataset.from_pandas(test_df[['instruction', 'input', 'output', 'label']]),
+        }
+        
+        print(f"train samples: {len(dataset['train'])}")
+        print(f"val samples: {len(dataset['validation'])}")
+        print(f"test samples: {len(dataset['test'])}")
 
         def preprocess(example):
             """
@@ -406,8 +471,8 @@ class FraudReasoningTrainer:
     # full pipeline
     # ----------------------------------------------------------
     def run_full_training(self, dataset_fraction: float = 1.0):
-        self.load_model_and_tokenizer(use_4bit=True)
-        self.setup_lora()
+        self.load_model_and_tokenizer()
+        self.setup_lora(rank=16, alpha=32)
         self.prepare_dataset(max_length=1024, dataset_fraction=dataset_fraction)  # reduced to 1024 for safety
         self.train(num_epochs=2, batch_size=2)
 

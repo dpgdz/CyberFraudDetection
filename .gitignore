@@ -209,3 +209,7 @@ __marimo__/
 data/
 models/
 .history/
+ouputs*/
+outputs_*/
+outputs/
+gpt2/

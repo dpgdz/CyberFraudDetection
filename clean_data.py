@@ -1,146 +1,163 @@
-"""
-Clean dataset by removing problematic samples
-"""
-import json
-from collections import Counter
+import pandas as pd
 
-print("=" * 70)
-print("CLEANING DATASET")
-print("=" * 70)
 
-def clean_split(input_path, output_path, max_chars=40000):
-    """Clean a single split file"""
+def clean_csv(input_path: str, output_path: str, max_chars: int = 40000):
+    """Clean a single CSV file"""
     
     print(f"\nProcessing: {input_path}")
     print("-" * 70)
     
-    samples = []
+    # Load CSV
+    df = pd.read_csv(input_path)
+    initial_count = len(df)
+    print(f"  Original samples: {initial_count}")
+    
+    # Track what gets removed
     removed = {
+        'missing': 0,
+        'empty': 0,
         'too_long': 0,
-        'duplicate': 0,
-        'empty': 0
+        'duplicates': 0
     }
     
-    seen_inputs = set()
+    # 1. Remove rows with missing values
+    df_clean = df.dropna(subset=['text', 'label', 'domain'])
+    removed['missing'] = initial_count - len(df_clean)
     
-    with open(input_path, 'r', encoding='utf-8') as f:
-        for line_num, line in enumerate(f, 1):
-            sample = json.loads(line)
-            
-            # Check for empty fields
-            if not sample.get('input', '').strip() or not sample.get('output', '').strip():
-                removed['empty'] += 1
-                continue
-            
-            # Check for too long
-            if len(sample['input']) > max_chars:
-                removed['too_long'] += 1
-                print(f"  Removing line {line_num}: {len(sample['input'])} chars (too long)")
-                continue
-            
-            # Check for duplicates
-            input_text = sample['input']
-            if input_text in seen_inputs:
-                removed['duplicate'] += 1
-                continue
-            
-            seen_inputs.add(input_text)
-            samples.append(sample)
+    # 2. Remove empty text
+    df_clean = df_clean[df_clean['text'].str.strip() != '']
+    removed['empty'] = initial_count - removed['missing'] - len(df_clean)
     
-    # Write cleaned data
-    with open(output_path, 'w', encoding='utf-8') as f:
-        for sample in samples:
-            f.write(json.dumps(sample, ensure_ascii=False) + '\n')
+    # 3. Remove too long text
+    text_lengths = df_clean['text'].str.len()
+    too_long_mask = text_lengths > max_chars
+    removed['too_long'] = too_long_mask.sum()
     
-    print(f"  Original: {line_num} samples")
-    print(f"  Kept: {len(samples)} samples")
+    if removed['too_long'] > 0:
+        print(f"\n  Examples of removed long texts:")
+        long_samples = df_clean[too_long_mask].head(5)
+        for idx, row in long_samples.iterrows():
+            text_len = len(row['text'])
+            preview = row['text'][:80].replace('\n', ' ')
+            print(f"    - {text_len:,} chars: {preview}...")
+    
+    df_clean = df_clean[~too_long_mask]
+    
+    # 4. Remove duplicates based on text
+    removed['duplicates'] = df_clean.duplicated(subset=['text']).sum()
+    df_clean = df_clean.drop_duplicates(subset=['text'], keep='first')
+    
+    # Reset index
+    df_clean = df_clean.reset_index(drop=True)
+    
+    # Save cleaned CSV
+    df_clean.to_csv(output_path, index=False)
+    
+    # Print summary
+    print(f"\n  After cleaning: {len(df_clean)} samples")
     print(f"  Removed:")
-    print(f"    - Too long: {removed['too_long']}")
-    print(f"    - Duplicates: {removed['duplicate']}")
-    print(f"    - Empty: {removed['empty']}")
-    print(f"  Output: {output_path}")
+    print(f"    - Missing/NaN: {removed['missing']}")
+    print(f"    - Empty text: {removed['empty']}")
+    print(f"    - Too long (>{max_chars:,} chars): {removed['too_long']}")
+    print(f"    - Duplicates: {removed['duplicates']}")
+    print(f"    - Total removed: {sum(removed.values())} ({sum(removed.values())/initial_count*100:.2f}%)")
     
-    return seen_inputs
-
-# Clean all splits
-print("\n1. Cleaning training set...")
-train_inputs = clean_split(
-    "data/fraud_train_multi_task.jsonl",
-    "data/fraud_train_clean.jsonl",
-    max_chars=40000
-)
-
-print("\n2. Cleaning validation set...")
-# Also remove any samples that appear in training
-with open("data/fraud_val_multi_task.jsonl", 'r') as f:
-    val_samples = []
-    overlap_count = 0
-    for line in f:
-        sample = json.loads(line)
-        if sample['input'] not in train_inputs and len(sample['input']) <= 40000:
-            val_samples.append(sample)
-        else:
-            if sample['input'] in train_inputs:
-                overlap_count += 1
-
-with open("data/fraud_val_clean.jsonl", 'w') as f:
-    for sample in val_samples:
-        f.write(json.dumps(sample, ensure_ascii=False) + '\n')
-
-print(f"  Kept: {len(val_samples)} samples")
-print(f"  Removed {overlap_count} overlapping with train")
-print(f"  Output: data/fraud_val_clean.jsonl")
-
-print("\n3. Cleaning test set...")
-# Also remove any samples that appear in training or validation
-all_seen = train_inputs | {s['input'] for s in val_samples}
-
-with open("data/fraud_test_multi_task.jsonl", 'r') as f:
-    test_samples = []
-    overlap_count = 0
-    for line in f:
-        sample = json.loads(line)
-        if sample['input'] not in all_seen and len(sample['input']) <= 40000:
-            test_samples.append(sample)
-        else:
-            if sample['input'] in all_seen:
-                overlap_count += 1
-
-with open("data/fraud_test_clean.jsonl", 'w') as f:
-    for sample in test_samples:
-        f.write(json.dumps(sample, ensure_ascii=False) + '\n')
-
-print(f"  Kept: {len(test_samples)} samples")
-print(f"  Removed {overlap_count} overlapping with train/val")
-print(f"  Output: data/fraud_test_clean.jsonl")
-
-# Verify cleaned data
-print("\n" + "=" * 70)
-print("VERIFICATION")
-print("=" * 70)
-
-print("\nChecking cleaned data...")
-for name, path in [
-    ("Train", "data/fraud_train_clean.jsonl"),
-    ("Val", "data/fraud_val_clean.jsonl"),
-    ("Test", "data/fraud_test_clean.jsonl")
-]:
-    with open(path, 'r') as f:
-        samples = [json.loads(line) for line in f]
+    # Check cleaned data stats
+    max_len = df_clean['text'].str.len().max()
+    avg_len = df_clean['text'].str.len().mean()
     
-    max_len = max(len(s['input']) for s in samples)
-    avg_len = sum(len(s['input']) for s in samples) / len(samples)
+    print(f"\n  Cleaned data stats:")
+    print(f"    - Max text length: {max_len:,} chars")
+    print(f"    - Avg text length: {avg_len:,.0f} chars")
     
-    fraud = sum(1 for s in samples if 'classification: fraud' in s['output'].lower())
-    legit = len(samples) - fraud
+    # Label distribution
+    label_counts = df_clean['label'].value_counts()
+    print(f"\n  Label distribution:")
+    for label, count in label_counts.items():
+        print(f"    - {label}: {count} ({count/len(df_clean)*100:.1f}%)")
     
-    print(f"\n{name}:")
-    print(f"  Samples: {len(samples)}")
-    print(f"  Max input length: {max_len} chars")
-    print(f"  Avg input length: {avg_len:.0f} chars")
-    print(f"  Fraud: {fraud} ({fraud/len(samples)*100:.1f}%)")
-    print(f"  Legitimate: {legit} ({legit/len(samples)*100:.1f}%)")
+    print(f"\n  Output: {output_path}")
+    
+    return df_clean
 
-print("\n" + "=" * 70)
-print("DONE! Use the *_clean.jsonl files for training")
-print("=" * 70)
+
+def remove_cross_split_duplicates(train_path, val_path, test_path):
+    """Remove samples that appear in multiple splits"""
+    
+    print("\n" + "=" * 70)
+    print("REMOVING CROSS-SPLIT DUPLICATES (DATA LEAKAGE)")
+    print("=" * 70)
+    
+    # Load all splits
+    train_df = pd.read_csv(train_path)
+    val_df = pd.read_csv(val_path)
+    test_df = pd.read_csv(test_path)
+    
+    print(f"\nBefore removing overlaps:")
+    print(f"  Train: {len(train_df)} samples")
+    print(f"  Val:   {len(val_df)} samples")
+    print(f"  Test:  {len(test_df)} samples")
+    
+    # Get train texts
+    train_texts = set(train_df['text'].values)
+    
+    # Remove from val if in train
+    val_overlap = val_df['text'].isin(train_texts)
+    val_overlap_count = val_overlap.sum()
+    val_df_clean = val_df[~val_overlap]
+    
+    # Remove from test if in train or val
+    all_seen_texts = train_texts | set(val_df_clean['text'].values)
+    test_overlap = test_df['text'].isin(all_seen_texts)
+    test_overlap_count = test_overlap.sum()
+    test_df_clean = test_df[~test_overlap]
+    
+    # Save if changes were made
+    if val_overlap_count > 0:
+        val_df_clean.to_csv(val_path, index=False)
+        print(f"\n  Removed {val_overlap_count} samples from validation (overlap with train)")
+    else:
+        print(f"\n  No overlaps found in validation")
+    
+    if test_overlap_count > 0:
+        test_df_clean.to_csv(test_path, index=False)
+        print(f"  Removed {test_overlap_count} samples from test (overlap with train/val)")
+    else:
+        print(f"  No overlaps found in test")
+    
+    print(f"\nAfter removing overlaps:")
+    print(f"  Train: {len(train_df)} samples")
+    print(f"  Val:   {len(val_df_clean)} samples")
+    print(f"  Test:  {len(test_df_clean)} samples")
+    
+    return len(train_df), len(val_df_clean), len(test_df_clean)
+
+
+if _name_ == "_main_":
+    print("=" * 70)
+    print("CSV DATA CLEANING")
+    print("=" * 70)
+    print("\nThis script will:")
+    print("  1. Remove samples with text >40,000 characters")
+    print("  2. Remove duplicate samples")
+    print("  3. Remove empty/missing values")
+    print("  4. Remove cross-split duplicates (data leakage)")
+    
+    # Define file paths
+    splits = [
+        ("data/train.csv", "data/train_clean.csv"),
+        ("data/validation.csv", "data/validation_clean.csv"),
+        ("data/test.csv", "data/test_clean.csv"),
+    ]
+    
+    # Clean each split
+    for input_path, output_path in splits:
+        print("\n" + "=" * 70)
+        clean_csv(input_path, output_path, max_chars=40000)
+    
+    # Remove cross-split duplicates
+    train_count, val_count, test_count = remove_cross_split_duplicates(
+        "data/train_clean.csv",
+        "data/validation_clean.csv",
+        "data/test_clean.csv"
+    )
